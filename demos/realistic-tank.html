@@ -255,6 +255,10 @@
         <span class="ico">📺</span>
         <span><b data-t="menu.share.title"></b><i data-t="menu.share.sub"></i></span>
       </button>
+      <button class="item" id="m-3d" type="button" aria-pressed="false">
+        <span class="ico">🎥</span>
+        <span><b data-t="menu.view3d.title"></b><i data-t="menu.view3d.sub"></i></span>
+      </button>
       <a class="item" id="m-home" href="/">
         <span class="ico">🏠</span>
         <span><b data-t="menu.home.title"></b><i data-t="menu.home.sub"></i></span>
@@ -329,6 +333,7 @@
 <script src="/vendor/GLTFLoader.js"></script>
 <script src="/vendor/DRACOLoader.js"></script>
 <script src="/vendor/SkeletonUtils.js"></script>
+<script src="/vendor/OrbitControls.js"></script>
 <script src="/assets/i18n.js"></script>
 <script src="/vendor/qr.js"></script>
 <script src="/assets/fish-frame.js"></script>
@@ -781,6 +786,10 @@
     );
     this.vel = new THREE.Vector3(Math.random() - 0.5, 0, Math.random() - 0.5).normalize().multiplyScalar(spec.speed);
     this.speed = spec.speed * (0.85 + Math.random() * 0.3);
+    // Разворот тела храним отдельно от mesh.quaternion: крен в повороте
+    // добавляется поверх каждый кадр и не должен копиться в состоянии.
+    this.quat = new THREE.Quaternion().setFromRotationMatrix(
+      _m4.lookAt(_l.copy(this.vel), _zero, _up));
     this.phase = built.phase;
 
     // Голод. noticeFood — с какого расстояния рыба видит корм: у каждой свой,
@@ -792,6 +801,8 @@
   }
 
   var _a = new THREE.Vector3(), _l = new THREE.Vector3(), _d = new THREE.Vector3();
+  var _m4 = new THREE.Matrix4(), _q = new THREE.Quaternion(), _f = new THREE.Vector3();
+  var _zero = new THREE.Vector3(), _up = new THREE.Vector3(0, 1, 0);
 
   Fish.prototype.update = function (dt, t) {
     _a.set(
@@ -881,8 +892,27 @@
 
     this.pos.addScaledVector(this.vel, dt);
     this.mesh.position.copy(this.pos);
-    this.mesh.lookAt(_l.copy(this.pos).add(this.vel));
-    this.mesh.rotation.z += Math.sin(t * 2.5 + this.phase) * 0.015;
+
+    // Раньше здесь был lookAt: нос прибивался к скорости за один кадр, и на
+    // отскоке от границы рыба разворачивалась рывком. Теперь угловая скорость
+    // ограничена, а в повороте рыба кренится внутрь виража, как настоящая.
+    //
+    // Тангаж зажат ~35°: рыба всплывает и ныряет почти горизонтально, а не
+    // встаёт свечкой, когда скорость уходит в вертикаль.
+    _l.copy(this.vel);
+    var horiz = Math.sqrt(_l.x * _l.x + _l.z * _l.z);
+    var maxY = Math.max(horiz * 0.7, 0.001);
+    if (_l.y > maxY) _l.y = maxY;
+    if (_l.y < -maxY) _l.y = -maxY;
+    _q.setFromRotationMatrix(_m4.lookAt(_l, _zero, _up));
+    this.quat.rotateTowards(_q, 3.0 * dt);
+    this.mesh.quaternion.copy(this.quat);
+
+    // Крен: знак — куда доворачиваем, величина — насколько нос отстал от курса.
+    _f.set(0, 0, 1).applyQuaternion(this.quat);
+    var bank = (_f.x * this.vel.z - _f.z * this.vel.x) / Math.max(this.vel.length(), 0.001);
+    this.mesh.rotateZ(Math.max(-0.4, Math.min(0.4, bank * 0.8)) +
+      Math.sin(t * 2.5 + this.phase) * 0.015);
 
     // Скелетная анимация Swim там, где она есть; изгиб шейдером — где нет.
     //
@@ -1393,6 +1423,10 @@
     for (var i = 0; i < fishes.length; i++) fishes[i].update(dt, t);
     if (foods.length) updateFoods(dt, t);
 
+    if (orbit) {
+      orbit.update();
+      env3d.userData.dust.rotation.y += 0.06 * dt;
+    }
     renderer.render(scene, camera);
 
     // Снимаем сразу после render, пока кадр не стёрт, и не чаще, чем раз
@@ -1417,14 +1451,16 @@
     if (url === appliedBg) return;
     appliedBg = url;
     if (!url) {
-      scene.background = new THREE.Color(0x0e1013);
+      // In 3D the scene background belongs to the environment — the new picture waits in bg2d
+      if (orbit) bg2d = new THREE.Color(0x0e1013);
+      else scene.background = new THREE.Color(0x0e1013);
       return;
     }
     new THREE.TextureLoader().load(url, function (tex) {
-      if (appliedBg !== url) return;   // пока грузилась, выбрали другую
+      if (appliedBg !== url) return;   // another one was picked while this loaded
       tex.encoding = THREE.sRGBEncoding;
-      scene.background = tex;
-      fitBackground();
+      if (orbit) { bg2d = tex; }
+      else { scene.background = tex; fitBackground(); }
       wantShot(1);
     });
   }
@@ -1951,6 +1987,357 @@
       .then(function (r) { return r.json(); })
       .then(function (r) { seenFeedAt = r.feedAt; })   // уже покормили, по опросу не повторяем
       .catch(function () { /* без сервера корм всё равно упал */ });
+  };
+
+  // ── 3D mode: OrbitControls around the point the camera already looks at.
+  // The flat background picture cannot follow the camera, so while 3D is on
+  // it is replaced by a real environment. Built lazily on first toggle; in
+  // 2D mode none of this exists — the picture stays as it always was.
+  var orbit = null, env3d = null, bg2d = null;
+  var SURF_Y = 16;   // water surface — just above the top of the light rig
+
+  // Environment ported from fishtank (Wayne Yip, MIT) — same textures and
+  // shaders as our realistic fish: gradient sky, sand with running caustics,
+  // god-ray cone with polar noise, floating dust particles.
+  var ENV_URL = '/assets/models/pack/reeffish/env/';
+
+  function buildEnv3d() {
+    var g = new THREE.Group();
+    var tl = new THREE.TextureLoader();
+
+    var causticsTex = tl.load(ENV_URL + 'shared_caustics.jpg');
+    causticsTex.wrapS = causticsTex.wrapT = THREE.RepeatWrapping;
+    // no mipmaps: at the cone's UV seam the uv derivative jumps and the
+    // GPU paints a blurry column from the smallest mip along the seam
+    causticsTex.generateMipmaps = false;
+    causticsTex.minFilter = THREE.LinearFilter;
+
+    // Sky: fishtank gradient — white zenith, deep water at the horizon.
+    // Bottom color matches the 3D-mode fog so the ground fades in seamlessly.
+    g.add(new THREE.Mesh(
+      new THREE.SphereGeometry(250, 24, 16),
+      new THREE.ShaderMaterial({
+        side: THREE.BackSide, fog: false, depthWrite: false,
+        vertexShader: [
+          'varying float yPos;',
+          'void main() {',
+          '  yPos = normalize(position).y;',
+          '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);',
+          '}'].join('\n'),
+        fragmentShader: [
+          'varying float yPos;',
+          'void main() {',
+          // max() first: GLSL pow() is undefined for negative bases, and below
+          // the horizon the sky must stay deep blue anyway
+          '  float t = max(yPos, 0.0);',
+          '  gl_FragColor = mix(vec4(0.00, 0.53, 0.75, 1.0), vec4(1.0), t * t);',
+          '}'].join('\n')
+      })));
+
+    // Sand — the Ground.js recipe: one texture across the plane, plus the
+    // minimum of two counter-scrolling caustics layers on top. Unlit material
+    // on purpose: the scene spotlight is tuned for fish and burns any lit
+    // light-colored floor into a white pool.
+    var groundTex = tl.load(ENV_URL + 'ground_c.jpg');
+    groundTex.encoding = THREE.sRGBEncoding;
+    var groundMat = new THREE.MeshBasicMaterial({ color: 0xccccff, map: groundTex });
+    groundMat.onBeforeCompile = function (shader) {
+      shader.uniforms.uCausticsMap = { value: causticsTex };
+      shader.uniforms.uTime = uTime;
+      shader.fragmentShader = shader.fragmentShader
+        .replace('uniform vec3 diffuse;',
+          'uniform vec3 diffuse;\nuniform sampler2D uCausticsMap;\nuniform float uTime;')
+        .replace('#include <map_fragment>', [
+          '#include <map_fragment>',
+          'vec4 ns1 = texture2D(uCausticsMap, 7.0 * vUv + uTime * 0.04);',
+          'vec4 ns2 = texture2D(uCausticsMap, 5.0 * vUv - uTime * 0.04);',
+          'diffuseColor += vec4(0.5, 0.5, 0.6, 1.0) * min(ns1, ns2);'
+        ].join('\n'));
+    };
+    var floor = new THREE.Mesh(new THREE.PlaneGeometry(300, 300), groundMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = FLOOR + 0.01;
+    g.add(floor);
+
+    // Water surface seen from below. Ripples are the same caustics texture
+    // in two counter-scrolling layers, like the sand. Dissolves into the sky
+    // toward the rim.
+    var surf = new THREE.Mesh(
+      new THREE.CircleGeometry(130, 48),
+      new THREE.ShaderMaterial({
+        transparent: true, fog: false, depthWrite: false,
+        uniforms: { uTime: uTime, uMap: { value: causticsTex } },
+        vertexShader: [
+          'varying vec2 vP;',
+          'void main() {',
+          '  vP = (modelMatrix * vec4(position, 1.0)).xz;',
+          '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);',
+          '}'].join('\n'),
+        fragmentShader: [
+          'varying vec2 vP;',
+          'uniform float uTime;',
+          'uniform sampler2D uMap;',
+          'void main() {',
+          '  vec2 uv = vP * 0.045;',
+          '  vec3 ns = min(texture2D(uMap, uv + uTime * 0.02).rgb,',
+          '                texture2D(uMap, uv * 0.7 - uTime * 0.02).rgb);',
+          '  float r = dot(ns, vec3(0.30, 0.59, 0.11));',
+          '  vec3 c = vec3(0.16, 0.47, 0.60) + vec3(0.75, 0.90, 0.95) * r * 1.6;',
+          '  c += vec3(1.0, 0.98, 0.90) * smoothstep(45.0, 0.0, length(vP - vec2(0.0, -35.0))) * 0.5;',
+          '  gl_FragColor = vec4(c, smoothstep(130.0, 70.0, length(vP)));',
+          '}'].join('\n')
+      }));
+    surf.rotation.x = Math.PI / 2;
+    surf.position.y = SURF_Y;
+    surf.renderOrder = 2;
+    g.add(surf);
+
+    // God rays — the Godrays.js recipe: a cone from surface to floor with
+    // the same caustics running over it in polar coordinates. The original
+    // godrays_cone.gltf is Draco-compressed and a decoder for 4KB isn't worth
+    // it — cone dimensions were read from the gltf accessors (radius 15.6,
+    // length 13.7) and rebuilt with ConeGeometry.
+    var rays = new THREE.Mesh(
+      new THREE.ConeGeometry(15.6, 13.7, 48, 1, true),
+      new THREE.ShaderMaterial({
+        transparent: true, depthWrite: false, fog: false, side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+        uniforms: { uTime: uTime, uMap: { value: causticsTex } },
+        vertexShader: [
+          'varying vec2 vUv;',
+          'void main() {',
+          '  vUv = uv;',
+          '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);',
+          '}'].join('\n'),
+        fragmentShader: [
+          'varying vec2 vUv;',
+          'uniform float uTime;',
+          'uniform sampler2D uMap;',
+          'void main() {',
+          // circumference multiplier must be integer or the UV seam shows
+          '  vec2 polarUv = vec2(vUv.y * -0.02 + uTime * 0.10, vUv.x * 6.0);',
+          '  float lum = dot(texture2D(uMap, polarUv).rgb, vec3(0.30, 0.59, 0.11));',
+          '  float fade = smoothstep(0.0, 0.7, vUv.y);',
+          '  gl_FragColor = vec4(0.9, 0.9, 1.0, lum * fade * 0.35);',
+          '}'].join('\n')
+      }));
+    rays.position.set(0, 8.1, -3);
+    rays.scale.setScalar(1.15);   // stretch to span exactly floor..surface
+    rays.renderOrder = 3;
+    g.add(rays);
+
+    // Dust — the Particles.js recipe: a cloud of soft-sprite points that
+    // slowly rotates as a whole around the vertical (in animate). That's it.
+    var N = 400, pos = new Float32Array(N * 3);
+    for (var i = 0; i < N; i++) {
+      pos[i * 3] = (Math.random() * 2 - 1) * 17;
+      pos[i * 3 + 1] = 1 + Math.random() * (SURF_Y - 2);
+      pos[i * 3 + 2] = (Math.random() * 2 - 1) * 12;
+    }
+    var dustGeo = new THREE.BufferGeometry();
+    dustGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    var dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
+      size: 0.08, map: tl.load(ENV_URL + 'particles_a.png'),
+      transparent: true, opacity: 0.5, depthWrite: false
+    }));
+    dust.renderOrder = 4;
+    g.add(dust);
+    g.userData.dust = dust;
+    // These three are the "generic ocean". When the background has a depth
+    // map, the picture's own relief replaces them; sky and dust always stay.
+    g.userData.generic = [floor, surf, rays];
+    return g;
+  }
+
+  // ── Background as a "3D photo" ──────────────────────────────────────────
+  // Built-in backgrounds ship with a depth map (assets/backgrounds/depth/…,
+  // precomputed offline with Depth-Anything-V2: white = near, black = far).
+  // The picture is draped over a grid whose vertices slide away from the
+  // original 2D camera along their view rays by depth. From the original
+  // viewpoint the result matches the flat picture exactly; orbiting reveals
+  // real parallax in the foreground. User-uploaded backgrounds have no depth
+  // map — they keep the generic ocean above.
+  var relief = { url: null, mesh: null, token: 0 };
+
+  function depthUrlFor(url) {
+    var m = /^\/assets\/backgrounds\/([^\/]+)$/.exec(url || '');
+    return m ? '/assets/backgrounds/depth/' + m[1] : null;
+  }
+
+  function buildRelief(url, depthUrl, done) {
+    var img = new Image(), dep = new Image(), left = 2;
+    function step() { if (--left === 0) done(assemble()); }
+    img.onload = dep.onload = step;
+    img.onerror = dep.onerror = function () { done(null); };
+    img.src = url;
+    dep.src = depthUrl;
+
+    function assemble() {
+      // Half-size canvas doubles as a cheap blur: sharp depth edges make the
+      // grid zigzag on thin features like masts and ropes.
+      var cv = document.createElement('canvas');
+      cv.width = Math.max(1, dep.width >> 1);
+      cv.height = Math.max(1, dep.height >> 1);
+      var cx = cv.getContext('2d');
+      cx.drawImage(dep, 0, 0, cv.width, cv.height);
+      var px = cx.getImageData(0, 0, cv.width, cv.height).data;
+      function depthAt(u, v) {   // bilinear; v grows up, image rows go down
+        var x = Math.min(Math.max(u, 0), 1) * (cv.width - 1);
+        var y = (1 - Math.min(Math.max(v, 0), 1)) * (cv.height - 1);
+        var x0 = Math.floor(x), y0 = Math.floor(y);
+        var x1 = Math.min(x0 + 1, cv.width - 1), y1 = Math.min(y0 + 1, cv.height - 1);
+        var fx = x - x0, fy = y - y0;
+        var a = px[(y0 * cv.width + x0) * 4], b = px[(y0 * cv.width + x1) * 4];
+        var c = px[(y1 * cv.width + x0) * 4], d = px[(y1 * cv.width + x1) * 4];
+        return (a * (1 - fx) * (1 - fy) + b * fx * (1 - fy) +
+                c * (1 - fx) * fy + d * fx * fy) / 255;
+      }
+
+      // Grid extends past the picture: orbiting looks into the margins
+      // instead of a void. T_NEAR..T_FAR place the nearest and farthest
+      // plane along the ray from the original camera.
+      var GW = 300, GH = 200, T_FAR = 40, T_NEAR = 13;
+      var MX = 0.45, MYB = 0.3, MYT = 0.3;
+      var aspect = img.width / img.height;
+
+      // The margins get a blurred, slightly zoomed continuation of the
+      // picture instead of smeared edge pixels: a padded canvas is filled
+      // with a heavily blurred cover copy and the sharp original goes on
+      // top in the middle. At the orbit limits the edges dissolve into a
+      // watery haze instead of rubber streaks.
+      var padW = Math.round(img.width * (1 + 2 * MX));
+      var padH = Math.round(img.height * (1 + MYB + MYT));
+      var ps = Math.min(1, 4096 / Math.max(padW, padH));
+      var pad = document.createElement('canvas');
+      pad.width = Math.round(padW * ps);
+      pad.height = Math.round(padH * ps);
+      var pctx = pad.getContext('2d');
+      pctx.fillStyle = '#0087bf';   // sky-bottom blue where the blur thins out
+      pctx.fillRect(0, 0, pad.width, pad.height);
+      pctx.filter = 'blur(' + Math.round(pad.width / 60) + 'px)';
+      pctx.drawImage(img, -pad.width * 0.05, -pad.height * 0.05,
+        pad.width * 1.1, pad.height * 1.1);
+      pctx.filter = 'none';
+      pctx.drawImage(img, Math.round(MX * img.width * ps),
+        Math.round(MYT * img.height * ps),
+        Math.round(img.width * ps), Math.round(img.height * ps));
+      // same cover fit as the 2D background: wider screen scales the picture
+      // up instead of exposing the smeared margins
+      var halfH = Math.tan(camera.fov * Math.PI / 360) *
+        Math.max(1, camera.aspect / aspect);
+      var pos = new Float32Array((GW + 1) * (GH + 1) * 3);
+      var uvs = new Float32Array((GW + 1) * (GH + 1) * 2);
+      var n = 0;
+      for (var j = 0; j <= GH; j++) {
+        var v = -MYB + (1 + MYB + MYT) * j / GH;
+        for (var i = 0; i <= GW; i++) {
+          var u = -MX + (1 + 2 * MX) * i / GW;
+          var t = T_FAR + (T_NEAR - T_FAR) * Math.pow(depthAt(u, v), 1.15);
+          // the original camera looks straight down -z, so rays are trivial
+          var dx = (u - 0.5) * 2 * halfH * aspect;
+          var dy = (v - 0.5) * 2 * halfH;
+          var k = t / Math.sqrt(dx * dx + dy * dy + 1);
+          pos[n * 3] = CAM_POS[0] + dx * k;
+          pos[n * 3 + 1] = CAM_POS[1] + dy * k;
+          pos[n * 3 + 2] = CAM_POS[2] - k;
+          // UVs live in the padded canvas, so the margins sample the blur
+          uvs[n * 2] = (u + MX) / (1 + 2 * MX);
+          uvs[n * 2 + 1] = (v + MYB) / (1 + MYB + MYT);
+          n++;
+        }
+      }
+      var idx = [];
+      for (j = 0; j < GH; j++) {
+        for (i = 0; i < GW; i++) {
+          var a0 = j * (GW + 1) + i, a1 = a0 + 1, b0 = a0 + GW + 1, b1 = b0 + 1;
+          idx.push(a0, a1, b0, a1, b1, b0);
+        }
+      }
+      var geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      geo.setIndex(idx);
+
+      var tex = new THREE.Texture(pad);
+      tex.needsUpdate = true;
+      tex.encoding = THREE.sRGBEncoding;
+      tex.minFilter = THREE.LinearFilter;   // NPOT size, no mipmaps
+      // no fog, no lighting: the painting's colors must survive untouched
+      return new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, fog: false }));
+    }
+  }
+
+  // Decides what 3D shows: the current background's relief or the generic
+  // ocean. The relief builds asynchronously; the ocean covers the wait.
+  function reliefSync() {
+    var generic = env3d.userData.generic;
+    function showGeneric(on) {
+      for (var k = 0; k < generic.length; k++) generic[k].visible = on;
+      if (relief.mesh) relief.mesh.visible = !on;
+      // The relief is a bas-relief: seen from the side it falls apart into
+      // rubber. So with it the orbit is clamped to a peek; the generic
+      // ocean keeps the wide range.
+      if (!orbit) return;
+      orbit.minAzimuthAngle = on ? -1.1 : -0.22;
+      orbit.maxAzimuthAngle = on ? 1.1 : 0.22;
+      orbit.minPolarAngle = Math.PI * (on ? 0.30 : 0.46);
+      orbit.maxPolarAngle = Math.PI * (on ? 0.62 : 0.55);
+      orbit.minDistance = on ? 9 : 14;
+      orbit.maxDistance = on ? 30 : 21;
+    }
+    var want = depthUrlFor(appliedBg);
+    if (!want) { showGeneric(true); return; }
+    if (relief.url === appliedBg && relief.mesh) { showGeneric(false); return; }
+    showGeneric(true);
+    var token = ++relief.token;
+    buildRelief(appliedBg, want, function (mesh) {
+      if (token !== relief.token || !mesh) return;
+      if (relief.mesh) {
+        env3d.remove(relief.mesh);
+        relief.mesh.geometry.dispose();
+        relief.mesh.material.map.dispose();
+        relief.mesh.material.dispose();
+      }
+      relief.mesh = mesh;
+      relief.url = appliedBg;
+      env3d.add(mesh);
+      if (orbit) showGeneric(false);
+    });
+  }
+
+  document.getElementById('m-3d').onclick = function () {
+    hideMenu();
+    if (!orbit) {
+      if (!env3d) { env3d = buildEnv3d(); scene.add(env3d); }
+      env3d.visible = true;
+      bg2d = scene.background;
+      scene.background = new THREE.Color(0x2e86a8);
+      // fog matches the fishtank sky bottom so the ground fades seamlessly
+      scene.fog.color.setHex(0x0087bf);
+      orbit = new THREE.OrbitControls(camera, renderer.domElement);
+      orbit.target.fromArray(CAM_TARGET);
+      orbit.enableDamping = true;
+      orbit.dampingFactor = 0.08;
+      orbit.enablePan = false;
+      orbit.minDistance = 9;
+      orbit.maxDistance = 30;
+      orbit.minAzimuthAngle = -1.1;
+      orbit.maxAzimuthAngle = 1.1;
+      orbit.minPolarAngle = Math.PI * 0.30;
+      orbit.maxPolarAngle = Math.PI * 0.62;
+      reliefSync();   // after orbit exists: the relief clamps its angles
+      this.setAttribute('aria-pressed', 'true');
+    } else {
+      orbit.dispose();
+      orbit = null;
+      env3d.visible = false;
+      scene.background = bg2d;
+      scene.fog.color.setHex(0x2e86a8);
+      fitBackground();   // a new picture may have arrived while orbiting
+      camera.position.fromArray(CAM_POS);
+      camera.lookAt(new THREE.Vector3().fromArray(CAM_TARGET));
+      this.setAttribute('aria-pressed', 'false');
+    }
   };
 
   function fishWord(n) {
